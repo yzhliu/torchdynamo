@@ -567,6 +567,16 @@ def tvm(subgraph):
 
 
 @create_backend
+def raf(subgraph):
+    print("model =", type(subgraph.model), subgraph.model)
+    return subgraph.wrap_returns(
+        raf_compile_inner(
+            subgraph.scripted, subgraph.example_inputs, cuda=subgraph.is_cuda
+        )
+    )
+
+
+@create_backend
 def ansor(subgraph):
     """
     WARNING: this backend takes hours or days to train and
@@ -662,6 +672,46 @@ def tvm_compile_inner(jit_mod, example_inputs, log_file, trials=20000, cuda=Fals
         return [to_torch_tensor(m.get_output(i)) for i in range(m.get_num_outputs())]
 
     return exec_tvm
+
+
+def raf_compile_inner(jit_mod, example_inputs, cuda=False):
+    # based on functorch version in eager_compile.py
+    import raf
+    from raf._ffi.pass_ import FromRelay, validate_relay_param_name
+    from raf._core.ndarray import ndarray
+    from tvm import relay
+    from collections import OrderedDict
+
+    device = "cuda" if cuda else "cpu"
+
+    shape_list = [(f"inp_{idx}", i.shape) for idx, i in enumerate(example_inputs)]
+    relay_mod, relay_params = relay.frontend.from_pytorch(jit_mod, shape_list)
+    raf_mod = FromRelay()(relay_mod)
+
+    raf_params = OrderedDict()
+    for var in relay_mod["main"].params:
+        name = var.name_hint
+        if name in raf_params:
+            raf_params[validate_relay_param_name(name)] = ndarray(relay_params[name].numpy())
+    # relay_params may contain unused parameters, which are not present in meta_params
+    assert len(raf_params) <= len(relay_params)
+    r_model = raf.frontend.model.FrameworkModel(raf_mod, raf_mod, raf_params, {})
+    r_model.to(device=device)
+
+    def exec_raf(*args):
+        args = [a.contiguous() for a in args]
+        args = [raf.array(a.numpy(), device=device) for a in args]
+        # debug code
+        from .. import config
+        if config.debug:
+            debug_mod = r_model._internal(*args).mod
+            print(raf.ir.AsText(debug_mod))
+        ret = r_model(*args)
+        if isinstance(ret, (list, tuple)):
+            return [torch.from_numpy(nd_tensor.numpy()) for nd_tensor in ret]
+        return [torch.from_numpy(ret.numpy())]
+
+    return exec_raf
 
 
 @functools.lru_cache(None)
